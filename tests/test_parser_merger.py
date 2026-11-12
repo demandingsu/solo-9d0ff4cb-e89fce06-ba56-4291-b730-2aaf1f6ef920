@@ -1,6 +1,6 @@
 """解析器与合并器的单元测试（不依赖网络）。"""
 
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -12,6 +12,9 @@ from app.parser import (
     parse_detail,
     same_site,
 )
+
+_CST = timezone(timedelta(hours=8))   # UTC+8（上海）
+_EST = timezone(timedelta(hours=-5))  # UTC-5（纽约，冬令时）
 
 
 # --------------------------------------------------------------------------- #
@@ -30,6 +33,31 @@ from app.parser import (
 )
 def test_parse_datetime(text, expected):
     assert parse_datetime(text) == expected
+
+
+# --------------------------------------------------------------------------- #
+# parse_datetime：时区偏移（跨时区公告不得丢掉偏移量）
+# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize(
+    "text,expected",
+    [
+        ("2026-11-05T09:00:00+08:00", datetime(2026, 11, 5, 9, 0, tzinfo=_CST)),
+        ("2026-11-04T21:00:00-05:00", datetime(2026, 11, 4, 21, 0, tzinfo=_EST)),
+        ("2026-11-05 09:00:00+0800", datetime(2026, 11, 5, 9, 0, tzinfo=_CST)),
+        ("2026-11-05T09:00:00Z", datetime(2026, 11, 5, 9, 0, tzinfo=timezone.utc)),
+        ("发布时间：2026-11-02T09:00:00+08:00（北京时间）", datetime(2026, 11, 2, 9, 0, tzinfo=_CST)),
+        ("2026-11-05T09:00:00.123+08:00", datetime(2026, 11, 5, 9, 0, tzinfo=_CST)),
+    ],
+)
+def test_parse_datetime_keeps_timezone_offset(text, expected):
+    result = parse_datetime(text)
+    assert result == expected
+    assert result.utcoffset() is not None  # 偏移量必须保留
+
+
+def test_parse_datetime_without_offset_stays_naive():
+    result = parse_datetime("2026-11-10 09:30")
+    assert result is not None and result.utcoffset() is None
 
 
 def test_same_site():
@@ -140,6 +168,25 @@ def test_parse_detail_cancellation():
     assert d.cancelled is True
     assert d.cancellation_reason == "预算收回"
     assert d.kind_hint == "cancellation"
+
+
+TZ_AWARE_HTML = """
+<html><head><title>跨境项目更正公告</title></head><body>
+<h1>跨境项目更正公告</h1>
+<ul>
+  <li data-field="project-code" data-value="GSB-2026-004"></li>
+  <li data-field="published-at" data-value="2026-11-04T21:00:00-05:00"></li>
+  <li data-field="deadline" data-value="2026-11-25T10:00:00-05:00"></li>
+</ul>
+</body></html>
+"""
+
+
+def test_parse_detail_preserves_timezone_offsets():
+    d = parse_detail(TZ_AWARE_HTML, "http://x/detail/tz.html")
+    assert d.published_at == datetime(2026, 11, 4, 21, 0, tzinfo=_EST)
+    assert d.deadline == datetime(2026, 11, 25, 10, 0, tzinfo=_EST)
+    assert d.published_at.utcoffset() == timedelta(hours=-5)
 
 
 def test_parse_detail_requires_title():
@@ -277,3 +324,127 @@ def test_merge_original_without_deadline_and_no_supplement_is_pending():
     )
     assert result.status == ProjectStatus.PENDING
     assert result.effective_deadline is None
+
+
+# --------------------------------------------------------------------------- #
+# 合并器：跨时区发布时间
+# --------------------------------------------------------------------------- #
+def test_merge_aware_notices_sorted_by_actual_moment_not_face_value():
+    """字面时间更早、实际时刻更晚的更正必须排在后面，最终期限取实际最新公告。"""
+    # 纽约 11-04 21:00(-05:00) = UTC 11-05 02:00，实际晚于上海 11-05 09:00(+08:00) = UTC 11-05 01:00
+    shanghai_corr = _notice(
+        NoticeKind.CORRECTION,
+        datetime(2026, 11, 5, 9, 0, tzinfo=_CST),
+        datetime(2026, 11, 20, 17, 0, tzinfo=_CST),
+        url="http://x/corr-shanghai.html",
+    )
+    newyork_corr = _notice(
+        NoticeKind.CORRECTION,
+        datetime(2026, 11, 4, 21, 0, tzinfo=_EST),
+        datetime(2026, 11, 25, 10, 0, tzinfo=_EST),
+        url="http://x/corr-newyork.html",
+    )
+    original = _notice(
+        NoticeKind.ORIGINAL,
+        datetime(2026, 11, 2, 9, 0, tzinfo=_CST),
+        datetime(2026, 11, 18, 17, 0, tzinfo=_CST),
+        url="http://x/original.html",
+    )
+    result = merge_notices(MergeInput(notices=[newyork_corr, original, shanghai_corr]))
+
+    assert result.status == ProjectStatus.OPEN
+    assert [str(n.url) for n in result.ordered_notices] == [
+        "http://x/original.html",
+        "http://x/corr-shanghai.html",
+        "http://x/corr-newyork.html",
+    ]
+    # 有效期限来自实际时刻最新的纽约更正，且偏移量保留
+    assert result.effective_deadline == datetime(2026, 11, 25, 10, 0, tzinfo=_EST)
+    assert result.effective_deadline.utcoffset() == timedelta(hours=-5)
+
+
+def test_merge_mixed_timezone_with_site_timezone_interprets_naive():
+    """混有无时区公告时，按请求提供的站点时区解释后参与排序。"""
+    original = _notice(
+        NoticeKind.ORIGINAL,
+        datetime(2026, 11, 3, 10, 0),  # 无时区
+        datetime(2026, 11, 17, 15, 0),
+        url="http://x/o.html",
+    )
+    correction = _notice(
+        NoticeKind.CORRECTION,
+        datetime(2026, 11, 6, 10, 0, tzinfo=_CST),
+        datetime(2026, 11, 24, 15, 0, tzinfo=_CST),
+        url="http://x/c.html",
+    )
+    result = merge_notices(
+        MergeInput(notices=[correction, original], site_timezone="Asia/Shanghai")
+    )
+
+    assert result.status == ProjectStatus.OPEN
+    # 无时区时间被解释为站点时区（上海 = UTC+8），偏移量体现在结果中
+    first = result.ordered_notices[0]
+    assert first.published_at == datetime(2026, 11, 3, 10, 0, tzinfo=_CST)
+    assert first.deadline == datetime(2026, 11, 17, 15, 0, tzinfo=_CST)
+    assert result.effective_deadline == datetime(2026, 11, 24, 15, 0, tzinfo=_CST)
+    assert any("Asia/Shanghai" in w for w in result.warnings)
+
+
+def test_merge_mixed_timezone_without_site_timezone_is_pending():
+    """混有时区口径且未提供站点时区 → 待核实，有效期限置空。"""
+    original = _notice(
+        NoticeKind.ORIGINAL,
+        datetime(2026, 11, 3, 10, 0),
+        datetime(2026, 11, 17, 15, 0),
+        url="http://x/o.html",
+    )
+    correction = _notice(
+        NoticeKind.CORRECTION,
+        datetime(2026, 11, 6, 10, 0, tzinfo=_CST),
+        datetime(2026, 11, 24, 15, 0, tzinfo=_CST),
+        url="http://x/c.html",
+    )
+    result = merge_notices(MergeInput(notices=[correction, original]))
+
+    assert result.status == ProjectStatus.PENDING
+    assert result.can_bid is False
+    assert result.effective_deadline is None  # 顺序不明，任何期限都不可信
+    assert any("时区" in w for w in result.warnings)
+    # 待核实也要返回可追溯的公告列表，且排序不能因混合口径崩溃
+    assert len(result.ordered_notices) == 2
+
+
+def test_merge_all_naive_keeps_local_time_semantics():
+    """全为无时区公告：沿用原有本地时间口径，不附加任何时区。"""
+    result = merge_notices(
+        MergeInput(
+            notices=[
+                _notice(NoticeKind.ORIGINAL, datetime(2026, 11, 1, 10), datetime(2026, 11, 10, 9, 30)),
+                _notice(NoticeKind.CORRECTION, datetime(2026, 11, 6, 9), datetime(2026, 11, 15, 14)),
+            ],
+            site_timezone="Asia/Shanghai",  # 即使提供了站点时区，全无时区公告也不改口径
+        )
+    )
+    assert result.status == ProjectStatus.OPEN
+    assert result.effective_deadline == datetime(2026, 11, 15, 14)
+    assert result.effective_deadline.utcoffset() is None
+
+
+def test_merge_pending_path_tolerates_mixed_timezone_notices():
+    """抓取失败叠加时区混杂时，待核实路径的排序不得抛出 TypeError。"""
+    result = merge_notices(
+        MergeInput(
+            notices=[
+                _notice(NoticeKind.ORIGINAL, datetime(2026, 11, 1, 10), datetime(2026, 11, 10, 9, 30)),
+                _notice(
+                    NoticeKind.CORRECTION,
+                    datetime(2026, 11, 6, 9, tzinfo=_CST),
+                    datetime(2026, 11, 15, 14, tzinfo=_CST),
+                ),
+            ],
+            failures=["http://x/missing.html"],
+        )
+    )
+    assert result.status == ProjectStatus.PENDING
+    assert result.effective_deadline is None
+    assert len(result.ordered_notices) == 2

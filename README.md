@@ -10,6 +10,9 @@
 | --- | --- |
 | 只采集列表页指向的**同站点**详情链接，外站链接、登录/导航链接自动忽略 | `app/parser.py::extract_detail_links` |
 | 按**发布时间**从早到晚合并原公告与更正公告 | `app/merger.py::merge_notices` |
+| 发布时间**带时区偏移**（如 `2026-11-04T21:00:00-05:00`）时按**实际时刻**排序，跨时区发布的更正不会因字面时间先后被排错；偏移量在结果中原样保留 | `app/parser.py::parse_datetime` + `app/merger.py` |
+| 同一项目**混有带/不带时区**的发布时间时：请求提供 `site_timezone`（IANA 时区名，如 `Asia/Shanghai`）→ 无时区时间按站点时区解释后参与排序；未提供 → 状态 `pending` 待核实、`effective_deadline=null` | `app/merger.py` |
+| 全部公告均**不带时区**时，沿用原有本地时间口径直接比较，不附加时区 | `app/merger.py` |
 | 更正公告**未提及截止时间**时，沿用此前已生效的截止时间 | `app/merger.py` |
 | 更正公告给出新截止时间（如延期）时，以新时间覆盖 | `app/merger.py` |
 | 公告明确**取消采购** → 状态 `closed`、不可投标，不再返回有效截止时间（旧时间仅在公告明细中保留） | `app/merger.py` |
@@ -37,7 +40,7 @@
 │   ├── list.html      # 公告列表页（含外站/登录干扰链接）
 │   └── detail/        # 3 个项目的原公告/更正/取消详情页
 ├── nginx/default.conf # 示例站点 nginx 配置（缺失页面返回真实 404）
-├── tests/             # 解析/合并单测 + 本地静态服务器端到端测试（30 个用例）
+├── tests/             # 解析/合并单测 + 本地静态服务器端到端测试（48 个用例）
 ├── Dockerfile
 ├── docker-compose.yml
 └── requirements.txt
@@ -69,10 +72,20 @@ curl -X POST http://localhost:8000/api/v1/collect \
   -d '{"list_url":"http://localhost:8080/list.html","project_code":"GSB-2026-001"}'
 ```
 
+跨时区/混合时区公告可携带 `site_timezone`（IANA 时区名），用于解释不带偏移量的发布时间：
+
+```bash
+curl -X POST http://localhost:8000/api/v1/collect \
+  -H 'Content-Type: application/json' \
+  -d '{"list_url":"http://localhost:8080/list.html","project_code":"GSB-2026-005","site_timezone":"Asia/Shanghai"}'
+```
+
 ### GET（便于浏览器快速验证）
 
 ```bash
 curl "http://localhost:8000/api/v1/collect?list_url=http://localhost:8080/list.html&project_code=GSB-2026-001"
+# 需要站点时区时：
+curl "http://localhost:8000/api/v1/collect?list_url=http://localhost:8080/list.html&project_code=GSB-2026-005&site_timezone=Asia/Shanghai"
 ```
 
 响应关键字段：
@@ -90,13 +103,18 @@ curl "http://localhost:8000/api/v1/collect?list_url=http://localhost:8080/list.h
 }
 ```
 
-## 示例站点内置的三个演示项目
+公告带时区偏移时，`published_at` / `deadline` / `effective_deadline` 会保留偏移量，例如
+`"effective_deadline": "2026-11-25T10:00:00-05:00"`。
+
+## 示例站点内置的五个演示项目
 
 | 项目编号 | 场景 | 预期结果 |
 | --- | --- | --- |
 | `GSB-2026-001` | 原公告 → 澄清更正（**未提截止时间，沿用原时间**）→ 延期更正（**新时间覆盖**） | `open`，有效截止时间 `2026-11-15 14:00` |
 | `GSB-2026-002` | 原公告 → 取消公告（预算收回） | `closed`，不可投标，无有效截止时间 |
 | `GSB-2026-003` | 原公告 → 更正页**已下线（404）** | `pending` 待核实，`effective_deadline=null`，来源中列出失败链接 |
+| `GSB-2026-004` | **跨时区发布**：原公告（UTC+8）→ 上海更正（UTC+8，延期至 11-20）→ 纽约更正（UTC-5，字面日期更早但**实际时刻更晚**，延期至 11-25） | `open`，按实际时刻排序，有效截止时间 `2026-11-25T10:00:00-05:00`（保留偏移量） |
+| `GSB-2026-005` | **混合时区口径**：原公告无时区（老系统）→ 更正带 UTC+8 偏移（新平台） | 提供 `site_timezone=Asia/Shanghai` → `open`，截止 `2026-11-24T15:00:00+08:00`；不提供 → `pending`，`effective_deadline=null` |
 
 另外列表页还包含：外站链接、登录导航链接、其他项目公告（`GSB-2026-099`）、
 无关项目的坏链接（`GSB-2025-888`），用于验证同站过滤、项目归属判定与失败隔离。
@@ -107,7 +125,9 @@ curl "http://localhost:8000/api/v1/collect?list_url=http://localhost:8080/list.h
    `<meta property="article:published_time">`；
 2. **标签匹配**：`发布时间 / 投标截止时间 / 响应文件递交截止时间 / 取消原因` 等
    中文标签，兼容 `th/td`、`dt/dd`、`li/p` 等布局，支持
-   `2026-11-10 09:30`、`2026年11月15日 14时00分` 等常见写法；
+   `2026-11-10 09:30`、`2026年11月15日 14时00分` 等常见写法，
+   以及 `2026-11-04T21:00:00-05:00`、`2026-11-05T09:00:00+08:00`（含 `Z`/`+0800`）
+   等带 ISO 8601 时区偏移的写法——偏移量会被保留，用于跨时区的实际时刻排序；
 3. **正文正则兜底**：在含“截止/递交/提交/受理”等时限语义的块级元素中识别日期，
    并排除“发布时间”句、资质业绩说明中的历史日期（如“近三年（2023年1月1日起）”）。
 
@@ -136,6 +156,11 @@ pytest -q
 
 - 列表页抓取失败直接返回 `502`；详情页失败不影响整体响应，而是按业务规则沉淀为
   `pending` + 失败来源链接，便于投标专员人工核实。
+- 时区处理分三档：全部公告带偏移 → 按实际时刻（换算同一时间基准）排序；
+  混有带/不带偏移 → 用请求提供的 `site_timezone`（IANA 名，经 `zoneinfo` 解析，
+  镜像内通过 `tzdata` 包保证时区数据可用）解释无时区时间，未提供则 `pending` 且期限置空；
+  全部不带偏移 → 保持原有本地时间口径，不附加时区。待核实路径的排序键对混合口径做了
+  归一，任何情况下都不会因“naive/aware 不可比较”而抛错。
 - 关联归属判定结合详情页项目编号与列表行上下文（含编号列），
   即使详情页下线（只能看到列表行）也能正确判定失败是否与目标项目相关；
   无关项目的坏链接不会污染查询结果。

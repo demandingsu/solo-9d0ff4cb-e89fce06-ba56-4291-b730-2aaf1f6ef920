@@ -121,9 +121,13 @@ async def collect(req: FetchRequest) -> FetchResponse:
             )
             # 缺发布时间在 merger 中按待核实处理。
 
-    # 4) 业务合并
+    # 4) 业务合并（site_timezone 用于解释混有时区口径公告中的无时区时间）
     merge_result = merge_notices(
-        MergeInput(notices=notices, failures=sorted(set(failures)))
+        MergeInput(
+            notices=notices,
+            failures=sorted(set(failures)),
+            site_timezone=req.site_timezone,
+        )
     )
 
     # 5) 组装来源链接

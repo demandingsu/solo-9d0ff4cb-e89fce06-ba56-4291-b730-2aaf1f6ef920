@@ -38,11 +38,11 @@ def client():
         yield c
 
 
-def _collect(client, list_url, code):
-    resp = client.post(
-        "/api/v1/collect",
-        json={"list_url": list_url, "project_code": code, "timeout": 5},
-    )
+def _collect(client, list_url, code, site_timezone=None):
+    payload = {"list_url": list_url, "project_code": code, "timeout": 5}
+    if site_timezone is not None:
+        payload["site_timezone"] = site_timezone
+    resp = client.post("/api/v1/collect", json=payload)
     assert resp.status_code == 200, resp.text
     return resp.json()
 
@@ -101,6 +101,77 @@ def test_unknown_project_returns_not_found(client, static_server):
     assert not any(s["role"] == "failed" for s in data["sources"])
 
 
+def test_project_004_cross_timezone_sorted_by_actual_moment(client, static_server):
+    """跨时区发布：字面时间早的纽约更正实际更晚，必须按实际时刻排序。"""
+    data = _collect(client, static_server, "GSB-2026-004")
+
+    assert data["status"] == "open"
+    assert data["can_bid"] is True
+
+    # 顺序：原公告(UTC 11-02 01:00) → 上海更正(UTC 11-05 01:00) → 纽约更正(UTC 11-05 02:00)
+    # 纽约更正字面时间 2026-11-04 21:00 更早，但实际时刻最晚，不得被排到前面
+    kinds = [n["kind"] for n in data["notices"]]
+    assert kinds == ["original", "correction", "correction"]
+    published = [n["published_at"] for n in data["notices"]]
+    assert published[1] == "2026-11-05T09:00:00+08:00"   # 上海
+    assert published[2] == "2026-11-04T21:00:00-05:00"   # 纽约（实际更晚）
+
+    # 有效期限取实际时刻最新的纽约更正，且偏移量保留（不得丢成无时区时间）
+    assert data["effective_deadline"] == "2026-11-25T10:00:00-05:00"
+    assert data["notices"][2]["deadline"] == "2026-11-25T10:00:00-05:00"
+
+    roles = {s["role"] for s in data["sources"]}
+    assert {"list", "original", "correction"} <= roles
+
+
+def test_project_005_mixed_timezone_with_site_timezone(client, static_server):
+    """混有无时区公告：提供站点时区后按其解释，正常给出有效期限。"""
+    data = _collect(client, static_server, "GSB-2026-005", site_timezone="Asia/Shanghai")
+
+    assert data["status"] == "open"
+    assert data["can_bid"] is True
+    # 无时区的原公告被解释为站点时区（UTC+8）
+    assert data["notices"][0]["published_at"] == "2026-11-03T10:00:00+08:00"
+    assert data["effective_deadline"] == "2026-11-24T15:00:00+08:00"
+    assert any("Asia/Shanghai" in w for w in data["warnings"])
+
+
+def test_project_005_mixed_timezone_without_site_timezone_is_pending(client, static_server):
+    """混有无时区公告且未提供站点时区：待核实，有效期限置空。"""
+    data = _collect(client, static_server, "GSB-2026-005")
+
+    assert data["status"] == "pending"
+    assert data["can_bid"] is False
+    assert data["effective_deadline"] is None
+    assert any("时区" in w for w in data["warnings"])
+    # 公告明细与来源仍完整返回，便于人工核实
+    assert len(data["notices"]) == 2
+    assert {s["role"] for s in data["sources"]} >= {"list", "original", "correction"}
+
+
+def test_invalid_site_timezone_rejected(client, static_server):
+    resp = client.post(
+        "/api/v1/collect",
+        json={
+            "list_url": static_server,
+            "project_code": "GSB-2026-005",
+            "site_timezone": "Mars/Olympus_Mons",
+            "timeout": 5,
+        },
+    )
+    assert resp.status_code == 422
+    # GET 查询参数形式同样返回 422 而非 500
+    resp = client.get(
+        "/api/v1/collect",
+        params={
+            "list_url": static_server,
+            "project_code": "GSB-2026-005",
+            "site_timezone": "Mars/Olympus_Mons",
+        },
+    )
+    assert resp.status_code == 422
+
+
 def test_external_and_nav_links_ignored(client, static_server):
     data = _collect(client, static_server, "GSB-2026-001")
     all_urls = [s["url"] for s in data["sources"]] + [n["url"] for n in data["notices"]]
@@ -115,6 +186,20 @@ def test_get_endpoint_works_the_same(client, static_server):
     )
     assert resp.status_code == 200
     assert resp.json()["status"] == "open"
+
+
+def test_get_endpoint_accepts_site_timezone(client, static_server):
+    resp = client.get(
+        "/api/v1/collect",
+        params={
+            "list_url": static_server,
+            "project_code": "GSB-2026-005",
+            "site_timezone": "Asia/Shanghai",
+        },
+    )
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "open"
+    assert resp.json()["effective_deadline"] == "2026-11-24T15:00:00+08:00"
 
 
 def test_bad_list_url_returns_502(client):

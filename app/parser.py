@@ -10,16 +10,18 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta, timezone, tzinfo
 from urllib.parse import urljoin, urlparse
 
 from bs4 import BeautifulSoup
 
-# 支持的日期时间写法，如 2026-11-05 09:00、2026年11月5日 9时00分、2026/11/05
+# 支持的日期时间写法，如 2026-11-05 09:00、2026年11月5日 9时00分、2026/11/05；
+# 第一种写法可携带 ISO 8601 时区偏移（+08:00 / +0800 / -05:00 / Z），
+# 跨时区平台发布的公告必须保留偏移量，否则合并时会丢掉真实先后关系
 _DATETIME_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
     re.compile(p)
     for p in (
-        r"(\d{4})[-/](\d{1,2})[-/](\d{1,2})[ T](\d{1,2}):(\d{2})(?::(\d{2}))?",
+        r"(\d{4})[-/](\d{1,2})[-/](\d{1,2})[ T](\d{1,2}):(\d{2})(?::(\d{2})(?:\.\d+)?)?\s*([Zz]|[+-]\d{2}:?\d{2})?(?![\d:])",
         r"(\d{4})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日\s*(\d{1,2})\s*[:：时]\s*(\d{1,2})\s*分?(?:\s*(\d{1,2})\s*秒)?",
         r"(\d{4})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日(?!\s*\d)",  # 仅日期，如 2026年11月03日
     )
@@ -72,8 +74,29 @@ class DetailData:
 # --------------------------------------------------------------------------- #
 # 通用工具
 # --------------------------------------------------------------------------- #
+def _parse_tz_offset(raw: str | None) -> tzinfo | None:
+    """把 ISO 8601 偏移量文本（``Z`` / ``+08:00`` / ``+0800`` / ``-05:00``）转为 tzinfo。"""
+    if not raw:
+        return None
+    raw = raw.strip()
+    if raw in ("Z", "z"):
+        return timezone.utc
+    match = re.fullmatch(r"([+-])(\d{2}):?(\d{2})", raw)
+    if not match:
+        return None
+    hours, minutes = int(match.group(2)), int(match.group(3))
+    if hours > 14 or minutes > 59:  # 合法偏移范围 -12:00 ~ +14:00
+        return None
+    delta = timedelta(hours=hours, minutes=minutes)
+    return timezone(delta if match.group(1) == "+" else -delta)
+
+
 def parse_datetime(text: str | None) -> datetime | None:
-    """从一段文本中解析出第一个日期时间；只有日期时按当天 00:00 处理。"""
+    """从一段文本中解析出第一个日期时间；只有日期时按当天 00:00 处理。
+
+    文本携带 ISO 8601 时区偏移（如 ``2026-11-05T09:00:00+08:00``）时返回
+    带时区的 datetime，偏移量保留在结果中；未携带时返回无时区的本地时间。
+    """
     if not text:
         return None
     for pattern in _DATETIME_PATTERNS:
@@ -86,7 +109,8 @@ def parse_datetime(text: str | None) -> datetime | None:
             return datetime(year, month, day)
         year, month, day, hour, minute = (int(g) for g in groups[:5])
         second = int(groups[5]) if len(groups) >= 6 and groups[5] else 0
-        return datetime(year, month, day, hour, minute, second)
+        tz = _parse_tz_offset(groups[6]) if len(groups) >= 7 else None
+        return datetime(year, month, day, hour, minute, second, tzinfo=tz)
     match = _DATE_ONLY.search(text)
     if match:
         year, month, day = (int(g) for g in match.groups())

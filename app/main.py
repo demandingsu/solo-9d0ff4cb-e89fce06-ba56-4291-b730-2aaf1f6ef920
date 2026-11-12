@@ -9,8 +9,9 @@
 
 from __future__ import annotations
 
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import HTMLResponse
+from pydantic import ValidationError
 
 from app.collector import collect
 from app.models import FetchRequest, FetchResponse
@@ -41,6 +42,7 @@ pre { background: #f4f4f6; padding: 1rem; border-radius: 8px; overflow:auto; max
 <form id="f">
   <p><label>列表页 URL <input id="list_url" value="http://localhost:8080/list.html"></label></p>
   <p><label>项目编号 <input id="project_code" value="GSB-2026-001"></label></p>
+  <p><label>站点时区（可选） <input id="site_timezone" placeholder="如 Asia/Shanghai" style="width:14rem"></label></p>
   <button type="submit">采集并合并</button>
 </form>
 <pre id="out">响应将显示在这里……</pre>
@@ -53,6 +55,8 @@ document.getElementById('f').addEventListener('submit', async (e) => {
     list_url: document.getElementById('list_url').value,
     project_code: document.getElementById('project_code').value
   };
+  const tz = document.getElementById('site_timezone').value.trim();
+  if (tz) payload.site_timezone = tz;
   try {
     const resp = await fetch('/api/v1/collect', {
       method: 'POST',
@@ -89,5 +93,17 @@ async def collect_get(
     list_url: str = Query(..., description="采购公告列表页 URL"),
     project_code: str = Query(..., description="项目编号"),
     timeout: float = Query(10.0, ge=1.0, le=60.0),
+    site_timezone: str | None = Query(
+        None, description="公告站点 IANA 时区名（如 Asia/Shanghai），用于解释无时区的发布时间"
+    ),
 ) -> FetchResponse:
-    return await collect(FetchRequest(list_url=list_url, project_code=project_code, timeout=timeout))
+    try:
+        req = FetchRequest(
+            list_url=list_url,
+            project_code=project_code,
+            timeout=timeout,
+            site_timezone=site_timezone,
+        )
+    except ValidationError as exc:  # 查询参数形式的手动建模，校验失败同样返回 422
+        raise HTTPException(status_code=422, detail=exc.errors(include_context=False)) from exc
+    return await collect(req)

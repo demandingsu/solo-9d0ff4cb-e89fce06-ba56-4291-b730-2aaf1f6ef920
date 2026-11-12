@@ -4,8 +4,9 @@ from __future__ import annotations
 
 from datetime import datetime
 from enum import Enum
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from pydantic import BaseModel, Field, HttpUrl
+from pydantic import BaseModel, Field, HttpUrl, field_validator
 
 
 class ProjectStatus(str, Enum):
@@ -35,10 +36,33 @@ class FetchRequest(BaseModel):
     list_url: HttpUrl = Field(..., description="采购公告列表页 URL")
     project_code: str = Field(..., min_length=1, description="项目编号，如 GSB-2026-001")
     timeout: float = Field(10.0, ge=1.0, le=60.0, description="单次请求超时时间（秒）")
+    site_timezone: str | None = Field(
+        None,
+        description="公告站点的 IANA 时区名（如 Asia/Shanghai）。同一项目混有带/不带时区偏移的"
+        "发布时间时，无时区时间按该时区解释；不提供则无法确定真实先后顺序，结果标记为待核实",
+    )
+
+    @field_validator("site_timezone")
+    @classmethod
+    def _validate_site_timezone(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        value = value.strip()
+        if not value:
+            return None
+        try:
+            ZoneInfo(value)
+        except ZoneInfoNotFoundError as exc:
+            raise ValueError(f"无效的 IANA 时区名称：{value}") from exc
+        return value
 
 
 class NoticeRecord(BaseModel):
-    """单条公告详情的解析结果（按发布时间排序）。"""
+    """单条公告详情的解析结果（按发布时间排序）。
+
+    发布时间/截止时间携带时区偏移时，偏移量原样保留；请求提供了站点时区时，
+    无时区时间会被解释为站点时区并带上对应偏移。
+    """
 
     url: HttpUrl
     kind: NoticeKind
